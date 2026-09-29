@@ -1,0 +1,507 @@
+"""
+3D Optimization: finding the global maximum of a bumpy landscape.
+
+The landscape z = f(x, y) has several peaks. One of them is the global
+maximum; the rest are local maxima that can trap a naive search.
+
+Classic optimization methods compared:
+  1. Random search: evaluate a vector of random points, take the max
+  2. Bisection method: find where the derivative is zero, applied one
+     coordinate at a time (coordinate ascent with bisection line searches)
+  3. Hill climbing (single start)
+  4. Hill climbing with random restarts
+  5. Simulated annealing
+
+Experiments:
+  1. Head-to-head: one run of every method, with 3D plots of each search
+  2. Random search: how many sample points are needed to find the global max?
+  3. Bisection: convergence rate in 1D, and how many brackets it needs in 2D
+  4. Reliability vs cost: success rate and function evaluations over many trials
+
+Requires: numpy, matplotlib
+    pip install numpy matplotlib
+"""
+
+import math
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+TRIALS = 50                # trials per setting in experiments 2-4 (lower = faster)
+rng = np.random.default_rng(42)
+
+# ---------------------------------------------------------------------------
+# The landscape
+# ---------------------------------------------------------------------------
+
+X_MIN, X_MAX = -5.0, 5.0
+Y_MIN, Y_MAX = -5.0, 5.0
+
+# Each peak is (center_x, center_y, height, width)
+PEAKS = [
+    (-3.0, -3.0, 4.0, 1.0),
+    (3.0, -2.0, 5.0, 0.8),
+    (-2.0, 3.0, 6.0, 1.2),
+    (2.5, 2.5, 9.0, 0.6),   # global maximum: tall but narrow
+    (0.0, 0.0, 3.0, 1.5),
+]
+
+
+def landscape(x, y):
+    """Sum of Gaussian hills plus a small ripple. Works on scalars or arrays."""
+    z = 0.0
+    for cx, cy, h, w in PEAKS:
+        z = z + h * np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * w ** 2))
+    z = z + 0.3 * np.sin(2 * x) * np.cos(2 * y)
+    return z
+
+
+# Every search method calls f() instead of landscape() so we can count how
+# many function evaluations each one uses. That is the fair way to compare cost.
+EVALS = 0
+
+
+def f(x, y):
+    global EVALS
+    EVALS += np.size(x)
+    return landscape(x, y)
+
+
+def reset_evals():
+    global EVALS
+    EVALS = 0
+
+
+def clamp(x, y):
+    """Keep a point inside the search bounds."""
+    return min(max(x, X_MIN), X_MAX), min(max(y, Y_MIN), Y_MAX)
+
+
+def random_point():
+    return rng.uniform(X_MIN, X_MAX), rng.uniform(Y_MIN, Y_MAX)
+
+
+# ---------------------------------------------------------------------------
+# Search algorithms
+# ---------------------------------------------------------------------------
+
+def random_search(n_points):
+    """
+    Random search: evaluate a whole vector of random points at once and
+    keep the highest one. No gradients, no memory, trivially parallel.
+    Returns the best (x, y, z) and all sampled points.
+    """
+    xs = rng.uniform(X_MIN, X_MAX, n_points)
+    ys = rng.uniform(Y_MIN, Y_MAX, n_points)
+    zs = f(xs, ys)
+    i = np.argmax(zs)
+    return (xs[i], ys[i], zs[i]), (xs, ys, zs)
+
+
+def derivative(g, t, h=1e-5):
+    """Central-difference estimate of g'(t)."""
+    return (g(t + h) - g(t - h)) / (2 * h)
+
+
+def bisection_max_1d(g, a, b, tol=1e-6, max_iters=100):
+    """
+    Bisection method for optimization in 1D.
+
+    A maximum of g is where g'(t) = 0 with g' going from + to -. If
+    g'(a) > 0 and g'(b) < 0, a maximum lies in [a, b]. Check the midpoint:
+    if g'(m) > 0 the peak is to the right, otherwise it's to the left.
+    Each step halves the bracket, so error shrinks by 2x per iteration.
+    Returns the maximiser and the list of brackets visited.
+    """
+    history = [(a, b)]
+    for _ in range(max_iters):
+        if b - a < tol:
+            break
+        m = (a + b) / 2
+        if derivative(g, m) > 0:
+            a = m
+        else:
+            b = m
+        history.append((a, b))
+    return (a + b) / 2, history
+
+
+def bisection_line_search(g, lo, hi, current, n_brackets=20, tol=1e-6):
+    """
+    Maximise g on [lo, hi]. Plain bisection needs a single bracket with
+    g' going + to -, but a bumpy line has several peaks. So split [lo, hi]
+    into n_brackets pieces, run bisection in every piece where the
+    derivative changes sign from + to -, and keep the best peak found.
+    n_brackets=1 is plain bisection over the whole interval.
+    """
+    ts = np.linspace(lo, hi, n_brackets + 1)
+    ds = [derivative(g, t) for t in ts]
+    candidates = [lo, hi, current]          # endpoints can be maxima too
+    for i in range(n_brackets):
+        if ds[i] > 0 and ds[i + 1] < 0:
+            t, _ = bisection_max_1d(g, ts[i], ts[i + 1], tol)
+            candidates.append(t)
+    return max(candidates, key=g)
+
+
+def coordinate_bisection(start, n_brackets=20, sweeps=20, tol=1e-6):
+    """
+    Bisection in 2D via coordinate ascent: hold y fixed and maximise over x
+    with a bisection line search, then hold x fixed and maximise over y.
+    Repeat until the point stops moving. Returns the path of (x, y, z).
+    """
+    x, y = start
+    path = [(x, y, f(x, y))]
+    for _ in range(sweeps):
+        old = (x, y)
+        x = bisection_line_search(lambda t: f(t, y), X_MIN, X_MAX, x, n_brackets, tol)
+        path.append((x, y, f(x, y)))
+        y = bisection_line_search(lambda t: f(x, t), Y_MIN, Y_MAX, y, n_brackets, tol)
+        path.append((x, y, f(x, y)))
+        if math.hypot(x - old[0], y - old[1]) < tol:
+            break
+    return path
+
+
+def hill_climb(start, step=0.1, max_iters=2000):
+    """
+    Steepest-ascent hill climbing: look at the 8 neighbours and move to the
+    best one. Stop when no neighbour is higher (a local maximum).
+    Returns the path taken as a list of (x, y, z).
+    """
+    x, y = start
+    z = f(x, y)
+    path = [(x, y, z)]
+    directions = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+
+    for _ in range(max_iters):
+        best = None
+        best_z = z
+        for dx, dy in directions:
+            nx, ny = clamp(x + dx * step, y + dy * step)
+            nz = f(nx, ny)
+            if nz > best_z:
+                best, best_z = (nx, ny), nz
+        if best is None:          # no uphill neighbour: we're on a peak
+            break
+        x, y = best
+        z = best_z
+        path.append((x, y, z))
+    return path
+
+
+def random_restart_hill_climb(restarts=20, step=0.1):
+    """Run hill climbing from many random starts and keep the best result."""
+    best_path = None
+    all_paths = []
+    for _ in range(restarts):
+        path = hill_climb(random_point(), step=step)
+        all_paths.append(path)
+        if best_path is None or path[-1][2] > best_path[-1][2]:
+            best_path = path
+    return best_path, all_paths
+
+
+def simulated_annealing(start=None, temp=10.0, cooling=0.995,
+                        min_temp=1e-3, step=0.5):
+    """
+    Simulated annealing: always accept uphill moves, and accept downhill
+    moves with probability exp(delta / T). As T cools, the search becomes
+    greedier. This lets it escape local maxima early on.
+    """
+    x, y = start if start else random_point()
+    z = f(x, y)
+    best = (x, y, z)
+    path = [(x, y, z)]
+
+    while temp > min_temp:
+        nx, ny = clamp(x + rng.normal(0, step), y + rng.normal(0, step))
+        nz = f(nx, ny)
+        delta = nz - z
+        if delta > 0 or rng.random() < math.exp(delta / temp):
+            x, y, z = nx, ny, nz
+            path.append((x, y, z))
+            if z > best[2]:
+                best = (x, y, z)
+        temp *= cooling
+    return best, path
+
+
+def grid_search(resolution=500):
+    """Brute force over a fine grid; used as ground truth for comparison."""
+    xs = np.linspace(X_MIN, X_MAX, resolution)
+    ys = np.linspace(Y_MIN, Y_MAX, resolution)
+    X, Y = np.meshgrid(xs, ys)
+    Z = landscape(X, Y)
+    i, j = np.unravel_index(np.argmax(Z), Z.shape)
+    return X[i, j], Y[i, j], Z[i, j]
+
+
+def is_global(z, true_max, tol=0.05):
+    return z >= true_max[2] - tol
+
+
+# ---------------------------------------------------------------------------
+# Experiment 1: head-to-head, one run of each method
+# ---------------------------------------------------------------------------
+
+def experiment_head_to_head(true_max):
+    print("=" * 72)
+    print("Experiment 1: head-to-head (one run each, hard start at (-4, -4))")
+    print("=" * 72)
+    start = (-4.0, -4.0)
+    runs = {}
+
+    reset_evals()
+    best, samples = random_search(1000)
+    runs["Random search (N=1000)"] = dict(best=best, samples=samples, evals=EVALS)
+
+    reset_evals()
+    path = coordinate_bisection(start, n_brackets=20)
+    runs["Coordinate bisection"] = dict(best=path[-1], path=path, evals=EVALS)
+
+    reset_evals()
+    path = hill_climb(start)
+    runs["Hill climbing (1 start)"] = dict(best=path[-1], path=path, evals=EVALS)
+
+    reset_evals()
+    best_path, paths = random_restart_hill_climb(restarts=20)
+    runs["Hill climbing (20 restarts)"] = dict(best=best_path[-1], paths=paths, evals=EVALS)
+
+    reset_evals()
+    best, path = simulated_annealing(start)
+    runs["Simulated annealing"] = dict(best=best, path=path, evals=EVALS)
+
+    print(f"{'Method':30s} {'x':>7s} {'y':>7s} {'z':>7s} {'evals':>8s}  result")
+    for name, r in runs.items():
+        x, y, z = r["best"]
+        tag = "GLOBAL max" if is_global(z, true_max) else "local max only"
+        print(f"{name:30s} {x:7.3f} {y:7.3f} {z:7.3f} {r['evals']:8d}  {tag}")
+    print()
+    return runs
+
+
+def plot_head_to_head(runs, true_max):
+    xs = np.linspace(X_MIN, X_MAX, 150)
+    ys = np.linspace(Y_MIN, Y_MAX, 150)
+    X, Y = np.meshgrid(xs, ys)
+    Z = landscape(X, Y)
+
+    fig = plt.figure(figsize=(18, 10))
+    fig.suptitle("Experiment 1: how each method searches the landscape")
+
+    for k, (name, r) in enumerate(runs.items()):
+        ax = fig.add_subplot(2, 3, k + 1, projection="3d")
+        ax.plot_surface(X, Y, Z, cmap="viridis", alpha=0.5, linewidth=0)
+        ax.set_title(name)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("f(x, y)")
+
+        if "samples" in r:
+            sx, sy, sz = r["samples"]
+            ax.scatter(sx, sy, sz, color="orange", s=3, alpha=0.6)
+        if "paths" in r:
+            for path in r["paths"]:
+                p = np.array(path)
+                ax.plot(p[:, 0], p[:, 1], p[:, 2] + 0.1, color="orange", lw=1)
+        if "path" in r:
+            p = np.array(r["path"])
+            ax.plot(p[:, 0], p[:, 1], p[:, 2] + 0.1, color="orange", lw=1.2)
+
+        ax.scatter(*r["best"], color="red", s=60,
+                   label=f"found z={r['best'][2]:.2f} ({r['evals']} evals)")
+        ax.scatter(*true_max, color="black", marker="*", s=150,
+                   label=f"true max z={true_max[2]:.2f}")
+        ax.legend(loc="upper left", fontsize=8)
+
+    # Sixth panel: top-down contour map with every method's answer
+    ax = fig.add_subplot(2, 3, 6)
+    cs = ax.contourf(X, Y, Z, levels=30, cmap="viridis")
+    fig.colorbar(cs, ax=ax, label="f(x, y)")
+    markers = ["o", "s", "^", "D", "v"]
+    for (name, r), m in zip(runs.items(), markers):
+        ax.scatter(r["best"][0], r["best"][1], marker=m, s=70,
+                   edgecolor="white", label=name)
+    ax.scatter(true_max[0], true_max[1], color="black", marker="*", s=200,
+               label="true max")
+    ax.set_title("Top view: where each method ended up")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.legend(fontsize=7, loc="lower left")
+
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Experiment 2: random search, success vs number of points
+# ---------------------------------------------------------------------------
+
+def experiment_random_search(true_max, sizes=(10, 50, 100, 500, 1000, 5000, 10000)):
+    print("=" * 72)
+    print(f"Experiment 2: random search, success rate vs N ({TRIALS} trials each)")
+    print("=" * 72)
+    print(f"{'N':>7s} {'success':>8s} {'mean best z':>12s} {'mean |z error|':>15s}")
+    results = []
+    for n in sizes:
+        zs = np.array([random_search(n)[0][2] for _ in range(TRIALS)])
+        success = np.mean([is_global(z, true_max) for z in zs])
+        err = np.mean(true_max[2] - zs)
+        results.append((n, success, err))
+        print(f"{n:7d} {success:8.0%} {zs.mean():12.3f} {err:15.4f}")
+    print()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Experiment 3: bisection convergence and number of brackets
+# ---------------------------------------------------------------------------
+
+def experiment_bisection(true_max, bracket_counts=(1, 2, 5, 10, 20, 50)):
+    print("=" * 72)
+    print("Experiment 3a: 1D bisection convergence on the slice y = 2.5")
+    print("=" * 72)
+    g = lambda t: landscape(t, 2.5)
+    x_star, _ = bisection_max_1d(g, 2.0, 3.0, tol=1e-13)   # reference answer
+    _, history = bisection_max_1d(g, 2.0, 3.0, tol=0, max_iters=30)
+    errors = [abs((a + b) / 2 - x_star) for a, b in history]
+    widths = [b - a for a, b in history]
+    for k in (0, 5, 10, 20, 30):
+        print(f"  iter {k:2d}: bracket width = {widths[k]:.2e}, error = {errors[k]:.2e}")
+    print(f"  -> maximiser on this slice: x = {x_star:.6f}\n")
+
+    print("=" * 72)
+    print(f"Experiment 3b: 2D coordinate bisection vs number of brackets "
+          f"({TRIALS} random starts)")
+    print("=" * 72)
+    print(f"{'brackets':>9s} {'success':>8s} {'mean evals':>11s}")
+    bracket_results = []
+    for nb in bracket_counts:
+        wins, evals = 0, []
+        for _ in range(TRIALS):
+            reset_evals()
+            z = coordinate_bisection(random_point(), n_brackets=nb)[-1][2]
+            evals.append(EVALS)
+            wins += is_global(z, true_max)
+        bracket_results.append((nb, wins / TRIALS, np.mean(evals)))
+        print(f"{nb:9d} {wins / TRIALS:8.0%} {np.mean(evals):11.0f}")
+    print()
+    return (widths, errors), bracket_results
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4: reliability vs cost over many trials
+# ---------------------------------------------------------------------------
+
+def experiment_reliability(true_max):
+    print("=" * 72)
+    print(f"Experiment 4: reliability vs cost ({TRIALS} trials, random starts)")
+    print("=" * 72)
+    methods = {
+        "Random search N=100": lambda: random_search(100)[0][2],
+        "Random search N=1000": lambda: random_search(1000)[0][2],
+        "Coord. bisection (20 br.)": lambda: coordinate_bisection(random_point())[-1][2],
+        "Hill climbing (1 start)": lambda: hill_climb(random_point())[-1][2],
+        "Hill climbing (20 restarts)": lambda: random_restart_hill_climb(20)[0][-1][2],
+        "Simulated annealing": lambda: simulated_annealing(random_point())[0][2],
+    }
+    print(f"{'Method':30s} {'success':>8s} {'mean evals':>11s} {'mean best z':>12s}")
+    results = []
+    for name, run in methods.items():
+        wins, evals, zs = 0, [], []
+        for _ in range(TRIALS):
+            reset_evals()
+            z = run()
+            evals.append(EVALS)
+            zs.append(z)
+            wins += is_global(z, true_max)
+        results.append((name, wins / TRIALS, np.mean(evals)))
+        print(f"{name:30s} {wins / TRIALS:8.0%} {np.mean(evals):11.0f} {np.mean(zs):12.3f}")
+    print()
+    return results
+
+
+def plot_experiments(random_results, bisection_conv, bracket_results, reliability):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Experiments 2-4: classic optimization methods")
+
+    # Experiment 2
+    ax = axes[0, 0]
+    ns, success, err = zip(*random_results)
+    ax.semilogx(ns, np.array(success) * 100, "o-", label="success rate")
+    ax.set_xlabel("number of random points N")
+    ax.set_ylabel("found global max (%)")
+    ax.set_ylim(-5, 105)
+    ax2 = ax.twinx()
+    ax2.semilogx(ns, err, "s--", color="tab:red", label="mean z error")
+    ax2.set_ylabel("mean z error", color="tab:red")
+    ax.set_title("Exp 2: random search needs many points")
+    ax.grid(alpha=0.3)
+
+    # Experiment 3a
+    ax = axes[0, 1]
+    widths, errors = bisection_conv
+    iters = np.arange(len(widths))
+    ax.semilogy(iters, widths, "o-", label="bracket width  (1 / 2^k)")
+    ax.semilogy(iters, np.maximum(errors, 1e-16), "s-", label="error |x_k - x*|")
+    ax.set_xlabel("bisection iteration k")
+    ax.set_ylabel("size (log scale)")
+    ax.set_title("Exp 3a: bisection halves the bracket each step")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # Experiment 3b
+    ax = axes[1, 0]
+    nbs, succ, evals = zip(*bracket_results)
+    labels = [str(n) for n in nbs]
+    ax.bar(labels, np.array(succ) * 100, color="tab:blue")
+    for i, e in enumerate(evals):
+        ax.text(i, succ[i] * 100 + 2, f"{e:.0f} evals", ha="center", fontsize=8)
+    ax.set_xlabel("brackets per line search")
+    ax.set_ylabel("found global max (%)")
+    ax.set_ylim(0, 115)
+    ax.set_title("Exp 3b: 2D bisection needs enough brackets")
+
+    # Experiment 4
+    ax = axes[1, 1]
+    for name, succ, evals in reliability:
+        ax.scatter(evals, succ * 100, s=80)
+        ax.annotate(name, (evals, succ * 100), textcoords="offset points",
+                    xytext=(6, 4), fontsize=8)
+    ax.set_xscale("log")
+    ax.set_xlim(50, 2e4)           # room for the labels on the right
+    ax.set_xlabel("mean function evaluations (log scale)")
+    ax.set_ylabel("found global max (%)")
+    ax.set_ylim(-5, 110)
+    ax.set_title("Exp 4: reliability vs cost (top-left is best)")
+    ax.grid(alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    true_max = grid_search()
+    print(f"Grid search (ground truth): x={true_max[0]:.3f}, "
+          f"y={true_max[1]:.3f}, z={true_max[2]:.3f}\n")
+
+    runs = experiment_head_to_head(true_max)
+    random_results = experiment_random_search(true_max)
+    bisection_conv, bracket_results = experiment_bisection(true_max)
+    reliability = experiment_reliability(true_max)
+
+    fig1 = plot_head_to_head(runs, true_max)
+    fig2 = plot_experiments(random_results, bisection_conv, bracket_results, reliability)
+    fig1.savefig("experiment1_landscape.png", dpi=120)
+    fig2.savefig("experiments2-4.png", dpi=120)
+    print("Saved plots: experiment1_landscape.png, experiments2-4.png")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
